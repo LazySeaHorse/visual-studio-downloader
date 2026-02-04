@@ -11,52 +11,239 @@ on:
         description: 'Release name (optional)'
         required: false
         default: ''
+      release_tag:
+        description: 'Release tag (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
 
 env:
-  VS_BOOTSTRAPPER_URL: https://aka.ms/vs/17/release/vs_community.exe  # Update when VS 2026 is available
   LAYOUT_PATH: ./vs_offline
   ARCHIVE_NAME: VS2026_Community_Offline
-  MAX_PART_SIZE: 1900M  # Keep under 2GB limit with buffer
+  MAX_PART_SIZE: 1900M
 
 jobs:
   build-installer:
     runs-on: windows-latest
-    timeout-minutes: 360  # 6 hours max
+    timeout-minutes: 360
     
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Setup environment
+    - name: Detect Latest VS Version
+      id: detect-vs
       shell: pwsh
       run: |
-        Write-Host "Runner specs:"
-        Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory, NumberOfProcessors
-        Get-PSDrive C | Select-Object Used, Free
+        Write-Host "Detecting latest Visual Studio version..."
         
+        # If version specified, use it
+        if ("${{ inputs.vs_version }}") {
+            $majorVersion = "${{ inputs.vs_version }}"
+            Write-Host "Using specified version: $majorVersion"
+        } else {
+            # Try to detect the latest version by checking URLs
+            # VS version numbers: 2019=16, 2022=17, 2026=18 or 19
+            $possibleVersions = 19, 18, 17, 16  # Check from newest to oldest
+            
+            foreach ($ver in $possibleVersions) {
+                $testUrl = "https://aka.ms/vs/$ver/release/vs_community.exe"
+                Write-Host "Checking version $ver at: $testUrl"
+                
+                try {
+                    $response = Invoke-WebRequest -Uri $testUrl -Method Head -UseBasicParsing -ErrorAction Stop
+                    if ($response.StatusCode -eq 200) {
+                        Write-Host "✓ Found working VS version: $ver"
+                        $majorVersion = $ver
+                        break
+                    }
+                } catch {
+                    Write-Host "✗ Version $ver not available"
+                }
+            }
+            
+            # If no version found, try the generic latest URL
+            if (-not $majorVersion) {
+                Write-Host "Trying generic latest URL..."
+                $testUrl = "https://aka.ms/vs/release/vs_community.exe"
+                try {
+                    $response = Invoke-WebRequest -Uri $testUrl -Method Head -UseBasicParsing -ErrorAction Stop
+                    if ($response.StatusCode -eq 200) {
+                        Write-Host "✓ Found working generic latest URL"
+                        $majorVersion = "latest"
+                    }
+                } catch {
+                    # Final fallback - assume VS 2026 is version 18
+                    Write-Host "Using fallback assumption: VS 2026 = version 18"
+                    $majorVersion = 18
+                }
+            }
+        }
+        
+        # Construct the URL
+        if ($majorVersion -eq "latest") {
+            $bootstrapperUrl = "https://aka.ms/vs/release/vs_community.exe"
+        } else {
+            $bootstrapperUrl = "https://aka.ms/vs/$majorVersion/release/vs_community.exe"
+        }
+        
+        Write-Host "================================"
+        Write-Host "VS Major Version: $majorVersion"
+        Write-Host "Bootstrapper URL: $bootstrapperUrl"
+        Write-Host "================================"
+        
+        echo "VS_BOOTSTRAPPER_URL=$bootstrapperUrl" >> $env:GITHUB_ENV
+        echo "VS_MAJOR_VERSION=$majorVersion" >> $env:GITHUB_ENV
+        
+        # Try to get more info about the actual version
+        try {
+            Write-Host "Fetching bootstrapper info..."
+            $tempFile = New-TemporaryFile
+            Invoke-WebRequest -Uri $bootstrapperUrl -OutFile $tempFile.FullName -UseBasicParsing
+            $fileInfo = Get-Item $tempFile.FullName
+            Write-Host "Bootstrapper size: $([math]::Round($fileInfo.Length / 1MB, 2)) MB"
+            
+            # Try to extract version from file
+            $fileVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($tempFile.FullName)
+            if ($fileVersion.FileVersion) {
+                Write-Host "File version: $($fileVersion.FileVersion)"
+                Write-Host "Product: $($fileVersion.ProductName)"
+                echo "VS_FILE_VERSION=$($fileVersion.FileVersion)" >> $env:GITHUB_ENV
+            }
+            
+            Remove-Item $tempFile.FullName -Force
+        } catch {
+            Write-Host "Could not fetch detailed version info"
+        }
+
+    - name: Get Latest 7-Zip
+      shell: pwsh
+      run: |
+        Write-Host "Getting latest 7-Zip..."
+        
+        # First try to get from winget (most reliable for latest)
+        try {
+            $wingetInfo = winget show 7zip.7zip --accept-source-agreements | Out-String
+            if ($wingetInfo -match 'Version:\s+(\d+\.\d+)') {
+                $version = $matches[1].Replace('.', '')
+                Write-Host "Latest 7-Zip version from winget: $version"
+            }
+        } catch {
+            Write-Host "Winget not available or failed"
+        }
+        
+        # Try to scrape 7-zip website as fallback
+        if (-not $version) {
+            try {
+                $page = Invoke-WebRequest -Uri "https://www.7-zip.org/" -UseBasicParsing
+                if ($page.Content -match 'Download 7-Zip (\d+\.?\d*\.?\d*)') {
+                    $versionString = $matches[1]
+                    $version = $versionString.Replace('.', '')
+                    Write-Host "Latest version from website: $versionString"
+                }
+            } catch {
+                Write-Host "Could not scrape 7-zip website"
+            }
+        }
+        
+        # Construct download URL or use fallback
+        if ($version) {
+            # Try the detected version
+            $url = "https://www.7-zip.org/a/7z${version}-x64.msi"
+            try {
+                $response = Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -ErrorAction Stop
+                Write-Host "✓ 7-Zip URL verified: $url"
+            } catch {
+                # If specific version fails, use the stable download link
+                $url = "https://www.7-zip.org/a/7zr.exe"
+                Write-Host "Using standalone 7-Zip"
+                echo "SEVENZIP_STANDALONE=true" >> $env:GITHUB_ENV
+            }
+        } else {
+            # Direct fallback to standalone
+            $url = "https://www.7-zip.org/a/7zr.exe"
+            echo "SEVENZIP_STANDALONE=true" >> $env:GITHUB_ENV
+        }
+        
+        echo "SEVENZIP_URL=$url" >> $env:GITHUB_ENV
+        Write-Host "7-Zip URL: $url"
+
+    - name: System Information
+      shell: pwsh
+      run: |
+        Write-Host "=== Build Environment ==="
+        Write-Host "Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        Write-Host "GitHub Runner Version: $env:RUNNER_NAME"
+        Write-Host "Windows Version: $([System.Environment]::OSVersion.Version)"
+        
+        $memory = Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty TotalPhysicalMemory
+        Write-Host "Total RAM: $([math]::Round($memory / 1GB, 2)) GB"
+        
+        $disk = Get-PSDrive C
+        Write-Host "Disk C: Free: $([math]::Round($disk.Free / 1GB, 2)) GB"
+        
+        Write-Host "=== Visual Studio Info ==="
+        Write-Host "VS Major Version: $env:VS_MAJOR_VERSION"
+        Write-Host "VS Bootstrapper URL: $env:VS_BOOTSTRAPPER_URL"
+        if ($env:VS_FILE_VERSION) {
+            Write-Host "VS File Version: $env:VS_FILE_VERSION"
+        }
+
     - name: Cache VS Layout
       id: cache-layout
       uses: actions/cache@v4
       with:
         path: ${{ env.LAYOUT_PATH }}
-        key: vs-layout-${{ github.sha }}
+        key: vs${{ env.VS_MAJOR_VERSION }}-layout-managed-desktop-${{ hashFiles('.github/workflows/vs-offline-installer.yml') }}
         restore-keys: |
-          vs-layout-
+          vs${{ env.VS_MAJOR_VERSION }}-layout-managed-desktop-
+          vs${{ env.VS_MAJOR_VERSION }}-layout-
 
     - name: Download VS Bootstrapper
       if: steps.cache-layout.outputs.cache-hit != 'true'
       shell: pwsh
       run: |
-        Write-Host "Downloading Visual Studio Bootstrapper..."
+        Write-Host "Downloading Visual Studio 2026 Bootstrapper..."
         $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri "${{ env.VS_BOOTSTRAPPER_URL }}" -OutFile "vs_community.exe"
         
+        $maxRetries = 3
+        for ($i = 1; $i -le $maxRetries; $i++) {
+            try {
+                Write-Host "Attempt $i of $maxRetries..."
+                Invoke-WebRequest -Uri "$env:VS_BOOTSTRAPPER_URL" -OutFile "vs_community.exe" -UseBasicParsing
+                
+                if (Test-Path "vs_community.exe") {
+                    $size = (Get-Item "vs_community.exe").Length / 1MB
+                    Write-Host "✓ Downloaded successfully: $([math]::Round($size, 2)) MB"
+                    
+                    # Verify it's a valid executable
+                    $signature = Get-AuthenticodeSignature "vs_community.exe"
+                    if ($signature.Status -eq "Valid") {
+                        Write-Host "✓ Digital signature is valid"
+                        Write-Host "  Signer: $($signature.SignerCertificate.Subject)"
+                    } else {
+                        Write-Warning "Digital signature check failed: $($signature.Status)"
+                    }
+                    break
+                }
+            } catch {
+                if ($i -eq $maxRetries) {
+                    throw "Failed to download after $maxRetries attempts: $_"
+                }
+                Write-Host "Download failed, waiting 5 seconds..."
+                Start-Sleep -Seconds 5
+            }
+        }
+
     - name: Create VS Offline Layout
       if: steps.cache-layout.outputs.cache-hit != 'true'
       shell: cmd
       timeout-minutes: 240
       run: |
-        echo Starting Visual Studio offline layout creation...
+        echo ========================================
+        echo Creating Visual Studio 2026 Offline Layout
+        echo This will download several GB of data
+        echo ========================================
+        
         vs_community.exe ^
           --layout %LAYOUT_PATH% ^
           --add Microsoft.VisualStudio.Workload.ManagedDesktop ^
@@ -64,136 +251,222 @@ jobs:
           --lang en-US ^
           --quiet ^
           --wait
-        echo Layout creation completed with exit code %ERRORLEVEL%
+        
+        if %ERRORLEVEL% neq 0 (
+          echo ERROR: Layout creation failed with code %ERRORLEVEL%
+          exit /b %ERRORLEVEL%
+        )
+        
+        echo Layout creation completed successfully!
 
-    - name: Verify layout size
+    - name: Verify Layout
       shell: pwsh
       run: |
-        $layoutSize = (Get-ChildItem -Path "${{ env.LAYOUT_PATH }}" -Recurse | 
-                      Measure-Object -Property Length -Sum).Sum
-        $layoutSizeGB = [math]::Round($layoutSize / 1GB, 2)
-        Write-Host "Layout size: $layoutSizeGB GB"
-        
-        if ($layoutSizeGB -gt 12) {
-          Write-Warning "Layout exceeds 12GB. Consider reducing workloads."
+        if (-not (Test-Path "$env:LAYOUT_PATH")) {
+            throw "Layout directory does not exist!"
         }
         
-        # Save size for later steps
-        echo "LAYOUT_SIZE_GB=$layoutSizeGB" >> $env:GITHUB_ENV
-
-    - name: Install 7-Zip
-      shell: pwsh
-      run: |
-        Write-Host "Installing 7-Zip..."
-        $7zUrl = "https://www.7-zip.org/a/7z2301-x64.msi"
-        Invoke-WebRequest -Uri $7zUrl -OutFile "7z-installer.msi"
-        Start-Process msiexec.exe -ArgumentList "/i", "7z-installer.msi", "/quiet" -Wait
-        $env:PATH += ";C:\Program Files\7-Zip"
-        echo "C:\Program Files\7-Zip" >> $env:GITHUB_PATH
-
-    - name: Create split archive
-      shell: pwsh
-      run: |
-        Write-Host "Creating split archive with 7-Zip..."
-        $archiveName = "${{ env.ARCHIVE_NAME }}.7z"
+        # Check for key files that should exist in a valid layout
+        $requiredFiles = @(
+            "vs_community.exe",
+            "ChannelManifest.json"
+        )
         
-        # Create archive with maximum compression and split into parts
-        & "C:\Program Files\7-Zip\7z.exe" a -t7z -mx=5 -v${{ env.MAX_PART_SIZE }} `
-          "$archiveName" "${{ env.LAYOUT_PATH }}\*" -mmt=on
-        
-        # List created parts
-        Get-ChildItem -Filter "${{ env.ARCHIVE_NAME }}.7z*" | ForEach-Object {
-          Write-Host "$($_.Name): $([math]::Round($_.Length / 1MB, 2)) MB"
+        foreach ($file in $requiredFiles) {
+            $filePath = Join-Path $env:LAYOUT_PATH $file
+            if (-not (Test-Path $filePath)) {
+                Write-Warning "Expected file not found: $file"
+            } else {
+                Write-Host "✓ Found: $file"
+            }
         }
         
-        # Count parts for upload
-        $partCount = (Get-ChildItem -Filter "${{ env.ARCHIVE_NAME }}.7z.*").Count
-        echo "PART_COUNT=$partCount" >> $env:GITHUB_ENV
+        # Calculate statistics
+        $stats = Get-ChildItem -Path $env:LAYOUT_PATH -Recurse -File | Measure-Object -Property Length -Sum
+        $sizeGB = [math]::Round($stats.Sum / 1GB, 2)
+        
+        Write-Host "=== Layout Statistics ==="
+        Write-Host "Total Size: $sizeGB GB"
+        Write-Host "Total Files: $($stats.Count)"
+        
+        # Check if it's a reasonable size
+        if ($sizeGB -lt 1) {
+            Write-Warning "Layout seems too small ($sizeGB GB), might be incomplete"
+        } elseif ($sizeGB -gt 14) {
+            Write-Warning "Layout is very large ($sizeGB GB), might exceed GitHub limits"
+        }
+        
+        echo "LAYOUT_SIZE_GB=$sizeGB" >> $env:GITHUB_ENV
+        echo "LAYOUT_FILE_COUNT=$($stats.Count)" >> $env:GITHUB_ENV
 
-    - name: Generate checksums
+    - name: Setup 7-Zip
       shell: pwsh
       run: |
+        if ($env:SEVENZIP_STANDALONE -eq "true") {
+            Write-Host "Downloading standalone 7-Zip..."
+            Invoke-WebRequest -Uri $env:SEVENZIP_URL -OutFile "7zr.exe" -UseBasicParsing
+            $env:SEVENZIP_EXE = (Resolve-Path "7zr.exe").Path
+        } else {
+            Write-Host "Installing 7-Zip MSI..."
+            Invoke-WebRequest -Uri $env:SEVENZIP_URL -OutFile "7z-installer.msi" -UseBasicParsing
+            Start-Process msiexec.exe -ArgumentList "/i", "7z-installer.msi", "/quiet", "/norestart" -Wait
+            
+            $7zPath = Get-ChildItem -Path "${env:ProgramFiles}" -Filter "7-Zip" -Directory | 
+                      Get-ChildItem -Filter "7z.exe" | 
+                      Select-Object -First 1 -ExpandProperty FullName
+                      
+            if (-not $7zPath) { 
+                $7zPath = "${env:ProgramFiles}\7-Zip\7z.exe" 
+            }
+            $env:SEVENZIP_EXE = $7zPath
+        }
+        
+        echo "SEVENZIP_EXE=$($env:SEVENZIP_EXE)" >> $env:GITHUB_ENV
+        Write-Host "7-Zip ready at: $($env:SEVENZIP_EXE)"
+        
+        # Test 7-Zip
+        & "$($env:SEVENZIP_EXE)" | Select-Object -First 2
+
+    - name: Create Split Archive
+      shell: pwsh
+      run: |
+        Write-Host "Creating split archive..."
+        
+        $archiveName = "$env:ARCHIVE_NAME.7z"
+        $layoutPath = (Resolve-Path $env:LAYOUT_PATH).Path
+        
+        Write-Host "Compressing: $layoutPath"
+        Write-Host "Output: $archiveName (split at $env:MAX_PART_SIZE)"
+        
+        & "$env:SEVENZIP_EXE" a -t7z -mx=5 "-v$env:MAX_PART_SIZE" -mmt=on -bsp1 "$archiveName" "$layoutPath\*"
+        
+        if ($LASTEXITCODE -ne 0) {
+            throw "Compression failed with exit code: $LASTEXITCODE"
+        }
+        
+        Write-Host "`n=== Archive Parts Created ==="
+        $parts = Get-ChildItem -Filter "$env:ARCHIVE_NAME.7z*" | Sort-Object Name
+        $totalSize = 0
+        foreach ($part in $parts) {
+            $sizeMB = [math]::Round($part.Length / 1MB, 2)
+            Write-Host "$($part.Name): $sizeMB MB"
+            $totalSize += $part.Length
+        }
+        
+        Write-Host "`nTotal compressed size: $([math]::Round($totalSize / 1GB, 2)) GB"
+        Write-Host "Compression ratio: $([math]::Round($totalSize / ($env:LAYOUT_SIZE_GB * 1GB) * 100, 1))%"
+        
+        echo "PART_COUNT=$($parts.Count)" >> $env:GITHUB_ENV
+
+    - name: Generate Metadata
+      shell: pwsh
+      run: |
+        # Generate checksums
         Write-Host "Generating checksums..."
-        $checksumFile = "checksums.txt"
+        $checksumHeader = @(
+            "# SHA256 Checksums for Visual Studio 2026 Community Offline Installer",
+            "# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC' -AsUTC)",
+            "# VS Version: $env:VS_MAJOR_VERSION"
+        )
+        $checksumHeader | Out-File "checksums.txt"
         
-        Get-ChildItem -Filter "${{ env.ARCHIVE_NAME }}.7z*" | ForEach-Object {
-          $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash
-          "$hash  $($_.Name)" | Out-File -Append -FilePath $checksumFile
+        Get-ChildItem -Filter "$env:ARCHIVE_NAME.7z*" | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+            "$hash  $($_.Name)" | Out-File -Append "checksums.txt"
+            Write-Host "✓ $($_.Name)"
         }
         
-        Write-Host "Checksums:"
-        Get-Content $checksumFile
+        # Generate JSON metadata
+        $metadata = @{
+            "created" = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            "vs_major_version" = $env:VS_MAJOR_VERSION
+            "vs_file_version" = $env:VS_FILE_VERSION
+            "layout_size_gb" = [decimal]$env:LAYOUT_SIZE_GB
+            "layout_files" = [int]$env:LAYOUT_FILE_COUNT
+            "archive_parts" = [int]$env:PART_COUNT
+            "workload" = "Microsoft.VisualStudio.Workload.ManagedDesktop"
+            "language" = "en-US"
+            "includes_recommended" = $true
+        }
+        $metadata | ConvertTo-Json -Depth 10 | Out-File "metadata.json"
+        
+        Write-Host "`nMetadata saved to metadata.json"
 
-    - name: Upload artifacts
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: vs-offline-parts
+        name: vs2026-offline-installer
         path: |
           ${{ env.ARCHIVE_NAME }}.7z*
           checksums.txt
+          metadata.json
         retention-days: 1
-        compression-level: 0  # Already compressed, no need for double compression
+        compression-level: 0
 
     - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/')
-      id: create_release
+      if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.release_tag
       uses: softprops/action-gh-release@v2
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
-        tag_name: ${{ github.ref_name }}
-        name: ${{ inputs.release_name || format('VS 2026 Community Offline - {0}', github.ref_name) }}
+        tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+        name: ${{ inputs.release_name || format('VS 2026 Community Offline - {0}', github.event.inputs.release_tag || github.ref_name) }}
         draft: false
         prerelease: false
+        generate_release_notes: true
         body: |
-          ## Visual Studio 2026 Community Offline Installer
+          # Visual Studio 2026 Community Offline Installer
           
-          This release contains an offline installer for Visual Studio 2026 Community with:
-          - **Workload**: Managed Desktop Development (WinForms, WPF, C#)
-          - **Components**: Recommended components including .NET Framework 4.8
-          - **Language**: English (en-US)
-          - **Total Size**: ~${{ env.LAYOUT_SIZE_GB }} GB
+          **Generated**: ${{ github.event.head_commit.timestamp || 'Manual trigger' }}  
+          **VS Version**: ${{ env.VS_MAJOR_VERSION }}  
+          **Total Size**: ${{ env.LAYOUT_SIZE_GB }} GB uncompressed  
           
-          ### 📦 Installation Instructions
+          ## 📦 Installation Instructions
           
-          1. Download all `.7z` parts (001, 002, etc.) to the same folder
-          2. Download `checksums.txt` to verify integrity
-          3. Extract using 7-Zip: Right-click on the `.7z.001` file and select "Extract Here"
+          1. Download **ALL** archive parts (`.7z.001`, `.7z.002`, etc.)
+          2. Place all parts in the same folder
+          3. Extract using 7-Zip (right-click `.7z.001` → "Extract Here")
           4. Run `vs_community.exe` from the extracted folder
-          5. Select "Install from layout folder" when prompted
+          5. Installation will proceed offline using the local layout
           
-          ### ✅ Verify Downloads
+          ## ✅ Verify Downloads
           
-          Use the provided `checksums.txt` to verify file integrity:
           ```powershell
-          Get-Content checksums.txt | ForEach-Object {
-            $parts = $_ -split '  '
-            $hash = (Get-FileHash -Path $parts[1] -Algorithm SHA256).Hash
-            if ($hash -eq $parts[0]) {
-              Write-Host "✓ $($parts[1])" -ForegroundColor Green
-            } else {
-              Write-Host "✗ $($parts[1])" -ForegroundColor Red
-            }
+          # Check file integrity
+          Get-Content checksums.txt | Select-String "\.7z" | ForEach-Object {
+              $hash, $file = $_ -split '  '
+              if (Test-Path $file) {
+                  $actual = (Get-FileHash $file -Algorithm SHA256).Hash
+                  if ($actual -eq $hash) {
+                      Write-Host "✓ $file" -ForegroundColor Green
+                  } else {
+                      Write-Host "✗ $file - CORRUPT!" -ForegroundColor Red
+                  }
+              } else {
+                  Write-Host "⚠ $file - MISSING!" -ForegroundColor Yellow
+              }
           }
           ```
           
-          ### 📝 Archive Information
-          - Archive format: 7-Zip
-          - Compression: Level 5 (balanced)
-          - Parts: ${{ env.PART_COUNT }} files
-          - Max part size: ${{ env.MAX_PART_SIZE }}
+          ## 📋 Contents
+          
+          - **Workload**: Managed Desktop Development
+          - **Includes**: WinForms, WPF, C#, .NET Framework 4.8
+          - **Language**: English (en-US)
+          - **Archive Parts**: ${{ env.PART_COUNT }}
+          - **Files**: ${{ env.LAYOUT_FILE_COUNT }}
         files: |
           ${{ env.ARCHIVE_NAME }}.7z*
           checksums.txt
+          metadata.json
 
-    - name: Cleanup workspace
+    - name: Cleanup
       if: always()
       shell: pwsh
       run: |
-        Write-Host "Cleaning up workspace..."
-        if (Test-Path "${{ env.LAYOUT_PATH }}") {
-          Remove-Item -Path "${{ env.LAYOUT_PATH }}" -Recurse -Force
-        }
-        Get-ChildItem -Filter "*.7z*" | Remove-Item -Force
-        if (Test-Path "vs_community.exe") {
-          Remove-Item "vs_community.exe" -Force
+        Write-Host "Cleaning up..."
+        @($env:LAYOUT_PATH, "vs_community.exe", "7z-installer.msi", "7zr.exe") | ForEach-Object {
+            if (Test-Path $_) {
+                Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "Removed: $_"
+            }
         }
