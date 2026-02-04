@@ -36,7 +36,7 @@ jobs:
         
     - name: Cache VS Layout
       id: cache-layout
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ${{ env.LAYOUT_PATH }}
         key: vs-layout-${{ github.sha }}
@@ -125,18 +125,19 @@ jobs:
         Get-Content $checksumFile
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: vs-offline-parts
         path: |
           ${{ env.ARCHIVE_NAME }}.7z*
           checksums.txt
         retention-days: 1
+        compression-level: 0  # Already compressed, no need for double compression
 
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
       id: create_release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
         tag_name: ${{ github.ref_name }}
